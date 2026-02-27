@@ -1,4 +1,10 @@
-import { MIRIS_ASSETS, MIRIS_VIEWER_KEY } from "./splat-config.js";
+
+import { MIRIS_ASSETS, MIRIS_VIEWER_KEY, TELEMETRY_ENDPOINT, VIEWER_VERSION } from "./splat-config.js";
+import { createFeatureRegistry } from "./src/features/featureRegistry.js";
+import { createViewerRuntime } from "./src/runtime/viewerRuntime.js";
+import { loadBuilderConfig, saveBuilderConfig } from "./src/config/builderConfig.js";
+import { createTelemetryClient } from "./src/telemetry/TelemetryClient.js";
+import { createBuilderPanel } from "./src/ui/builderPanel.js";
 
 const viewerStage = document.getElementById("viewer-stage");
 const controlsRoot = document.getElementById("controls");
@@ -10,6 +16,9 @@ if (!viewerStage || !controlsRoot) {
 if (!MIRIS_VIEWER_KEY || !Array.isArray(MIRIS_ASSETS) || MIRIS_ASSETS.length !== 3) {
   throw new Error("Invalid Miris config. Check splat-config.js.");
 }
+
+const featureRegistry = createFeatureRegistry();
+let builderConfig = loadBuilderConfig(featureRegistry);
 
 const sceneEl = document.createElement("miris-scene");
 sceneEl.setAttribute("key", MIRIS_VIEWER_KEY);
@@ -32,6 +41,7 @@ let lastRuntimeError = "";
 
 const manualStateByAssetId = new Map();
 const fitProfileByAssetId = new Map();
+const featureEnableStarts = new Map();
 
 const MIN_ZOOM = 0.08;
 const MAX_ZOOM = 3.5;
@@ -51,6 +61,8 @@ const TARGET_FILL_MAX = 0.88;
 const TARGET_CENTER_Y = 0.14;
 const MAX_FIT_STEPS = 22;
 const MAX_BOOT_FRAMES = 55;
+const RAGE_CLICK_WINDOW_MS = 1200;
+const RAGE_CLICK_THRESHOLD = 4;
 
 let activeFitToken = 0;
 
@@ -60,8 +72,36 @@ sampleCanvas.width = 192;
 sampleCanvas.height = 108;
 const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
 
+const interactionCounts = { rotate: 0, zoom: 0, pan: 0 };
+const interactionDurationsMs = { rotate: 0, zoom: 0, pan: 0 };
+const interactionStarts = { rotate: null, zoom: null, pan: null };
+const rageClicks = new Map();
+let firstInteractionMs = null;
+const viewerBootMs = performance.now();
+let hasEndedSession = false;
+let telemetrySendFailCount = 0;
+let lastTelemetryFailMs = 0;
+
+let frameCountWindow = 0;
+let frameElapsedWindow = 0;
+let lastPerfSampleMs = performance.now();
+let lastFrameTimeMs = performance.now();
+let fpsBucket = "unknown";
+let longFrameCount = 0;
+let webglContextLostCount = 0;
+let webglContextRestoredCount = 0;
+let webglListenersAttached = false;
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function inferFpsBucket(fps) {
+  if (!Number.isFinite(fps)) return "unknown";
+  if (fps < 20) return "lt20";
+  if (fps < 40) return "20_40";
+  if (fps < 55) return "40_55";
+  return "gt55";
 }
 
 function cloneState(state) {
@@ -74,6 +114,46 @@ function cloneState(state) {
     rotationY: Number(state.rotationY) || 0,
     rotationZ: Number(state.rotationZ) || 0
   };
+}
+
+function getTelemetryEndpoint() {
+  return builderConfig.telemetry.endpoint || TELEMETRY_ENDPOINT || "";
+}
+
+function emitTelemetry(name, payload = {}, category = "viewer") {
+  telemetryClient.track(name, payload, category);
+}
+
+function handleTelemetrySendFailure({ eventName, reason }) {
+  telemetrySendFailCount += 1;
+  const now = Date.now();
+  if (eventName === "telemetry_send_failed") return;
+  if ((now - lastTelemetryFailMs) < 15000) return;
+  lastTelemetryFailMs = now;
+  emitTelemetry("telemetry_send_failed", { event_name: eventName, reason }, "error");
+}
+
+let telemetryClient = createTelemetryClient({
+  endpoint: getTelemetryEndpoint(),
+  viewerVersion: VIEWER_VERSION,
+  enabled: builderConfig.telemetry.enabled,
+  onSendFailure: handleTelemetrySendFailure
+});
+
+function rebuildTelemetryClient() {
+  telemetryClient = createTelemetryClient({
+    endpoint: getTelemetryEndpoint(),
+    viewerVersion: VIEWER_VERSION,
+    enabled: builderConfig.telemetry.enabled,
+    onSendFailure: handleTelemetrySendFailure
+  });
+
+  if (componentsReady) {
+    void telemetryClient.startSession({
+      asset_id: activeAssetId || null,
+      device_type: IS_COARSE_POINTER ? "mobile" : "desktop"
+    });
+  }
 }
 
 function hasStreamTransformApi() {
@@ -115,14 +195,67 @@ function updateDebugHud() {
   ensureDebugHud();
   if (!debugHud) return;
   const hasCanvas = Boolean(getRenderCanvas());
+  const telemetryState = telemetryClient.getDebugState?.() || null;
+
   debugHud.textContent = [
     `ready: ${componentsReady}`,
     `asset: ${activeAssetId || "-"}`,
     `canvas: ${hasCanvas}`,
-    `coi: ${window.crossOriginIsolated}`,
     `coarse: ${IS_COARSE_POINTER}`,
+    `session: ${telemetryState?.sessionId || "-"}`,
+    `status: ${telemetryState?.lastStatus || "-"}`,
+    `queue: ${telemetryState?.queueLength ?? 0}`,
+    `fpsBucket: ${fpsBucket}`,
+    `longFrames: ${longFrameCount}`,
     `error: ${lastRuntimeError || "-"}`
   ].join("\n");
+}
+function markInteraction(type, pointer) {
+  interactionCounts[type] = (interactionCounts[type] || 0) + 1;
+  if (!interactionStarts[type]) {
+    interactionStarts[type] = performance.now();
+    emitTelemetry("interaction_start", { type, pointer }, "viewer");
+  }
+
+  if (firstInteractionMs == null) {
+    firstInteractionMs = Math.max(0, Math.round(performance.now() - viewerBootMs));
+    emitTelemetry("time_to_first_interaction", { type, ms: firstInteractionMs }, "viewer");
+  }
+}
+
+function endInteraction(type) {
+  if (!interactionStarts[type]) return;
+  const durationMs = Math.max(0, Math.round(performance.now() - interactionStarts[type]));
+  interactionStarts[type] = null;
+  interactionDurationsMs[type] += durationMs;
+  emitTelemetry("interaction_end", { type, duration_ms: durationMs }, "viewer");
+}
+
+function finalizeOpenInteractions() {
+  endInteraction("rotate");
+  endInteraction("zoom");
+  endInteraction("pan");
+}
+
+function trackRageClick(target) {
+  const key = target?.id || target?.dataset?.assetId || target?.className || target?.nodeName || "unknown";
+  const now = Date.now();
+  const item = rageClicks.get(key) || { count: 0, firstTs: now };
+  if ((now - item.firstTs) > RAGE_CLICK_WINDOW_MS) {
+    item.count = 0;
+    item.firstTs = now;
+  }
+  item.count += 1;
+  rageClicks.set(key, item);
+
+  if (item.count >= RAGE_CLICK_THRESHOLD) {
+    emitTelemetry("rage_click_detected", {
+      target_id: String(key),
+      burst_count: item.count,
+      window_ms: now - item.firstTs
+    }, "ui");
+    rageClicks.set(key, { count: 0, firstTs: now });
+  }
 }
 
 async function loadMirisComponents() {
@@ -140,6 +273,11 @@ async function loadMirisComponents() {
       lastError = error;
       const msg = typeof error?.message === "string" ? error.message : String(error);
       lastRuntimeError = `components import failed: ${moduleUrl} :: ${msg}`;
+      emitTelemetry("failed_asset_load", {
+        stage: "component_import",
+        url: moduleUrl,
+        message: msg
+      }, "error");
       updateDebugHud();
     }
   }
@@ -214,29 +352,6 @@ function getDefaultViewState(asset) {
   return state;
 }
 
-let mobileVisibilityToken = 0;
-async function ensureMobileVisibility(assetId) {
-  if (!IS_COARSE_POINTER) return;
-  const token = ++mobileVisibilityToken;
-
-  // Wait for frames so the first asset draw can land.
-  await raf();
-  await raf();
-  await raf();
-  if (token !== mobileVisibilityToken || activeAssetId !== assetId) return;
-
-  const measurement = measureFill();
-  if (measurement && measurement.heightRatio > 0.08) {
-    return;
-  }
-
-  const current = readCurrentViewState();
-  current.z = clamp(current.z + Math.max(1.4, Math.abs(current.z) * 0.35), MIN_Z, MAX_Z);
-  current.zoom = clamp(current.zoom * 1.25, MIN_ZOOM, MAX_ZOOM);
-  applyViewState(current);
-  saveManualStateForActive(current);
-}
-
 function readCurrentViewState() {
   return {
     x: Number(streamEl.position?.x) || 0,
@@ -249,9 +364,30 @@ function readCurrentViewState() {
   };
 }
 
+const viewerRuntime = createViewerRuntime({
+  constants: {
+    ROTATE_PITCH_MIN,
+    ROTATE_PITCH_MAX
+  },
+  getActiveAssetId: () => activeAssetId,
+  getCurrentViewState: () => readCurrentViewState(),
+  setViewState: (state) => applyViewState(state),
+  emitTelemetry
+});
+
+function enforceRuntimeConstraints(state) {
+  const constrained = cloneState(state);
+  for (const feature of featureRegistry) {
+    const featureConfig = builderConfig.features[feature.id];
+    if (!featureConfig || typeof feature.apply !== "function") continue;
+    feature.apply(featureConfig, viewerRuntime, constrained);
+  }
+  return constrained;
+}
+
 function applyViewState(state) {
   if (!hasStreamTransformApi()) return;
-  const safe = cloneState(state);
+  const safe = enforceRuntimeConstraints(state);
   streamEl.position.set(safe.x, safe.y, clamp(safe.z, MIN_Z, MAX_Z));
   streamEl.zoom = safe.zoom;
   streamEl.rotation.set(safe.rotationX, safe.rotationY, safe.rotationZ);
@@ -266,7 +402,6 @@ function saveManualStateForActive(state) {
   if (!activeAssetId) return;
   manualStateByAssetId.set(activeAssetId, cloneState(state));
 }
-
 function getViewportKey() {
   const widthBucket = Math.max(1, Math.round(viewerStage.clientWidth / 160));
   const heightBucket = Math.max(1, Math.round(viewerStage.clientHeight / 120));
@@ -313,6 +448,24 @@ function getRenderCanvas() {
   return null;
 }
 
+function attachWebglContextListenersIfNeeded() {
+  if (webglListenersAttached) return;
+  const canvas = getRenderCanvas();
+  if (!canvas) return;
+
+  canvas.addEventListener("webglcontextlost", () => {
+    webglContextLostCount += 1;
+    emitTelemetry("webgl_context_lost", { count: webglContextLostCount }, "error");
+  });
+
+  canvas.addEventListener("webglcontextrestored", () => {
+    webglContextRestoredCount += 1;
+    emitTelemetry("webgl_context_restored", { count: webglContextRestoredCount }, "viewer");
+  });
+
+  webglListenersAttached = true;
+}
+
 function measureFill() {
   if (!sampleCtx) return null;
   const canvas = getRenderCanvas();
@@ -331,7 +484,6 @@ function measureFill() {
   let maxY = -1;
   let hitCount = 0;
 
-  // The scene background is near black, so count meaningful color/alpha samples as splat coverage.
   for (let y = 0; y < targetHeight; y += 1) {
     for (let x = 0; x < targetWidth; x += 1) {
       const i = ((y * targetWidth) + x) * 4;
@@ -373,18 +525,38 @@ function raf() {
   return new Promise((resolve) => requestAnimationFrame(resolve));
 }
 
+let mobileVisibilityToken = 0;
+async function ensureMobileVisibility(assetId) {
+  if (!IS_COARSE_POINTER) return;
+  const token = ++mobileVisibilityToken;
+
+  await raf();
+  await raf();
+  await raf();
+  if (token !== mobileVisibilityToken || activeAssetId !== assetId) return;
+
+  const measurement = measureFill();
+  if (measurement && measurement.heightRatio > 0.08) {
+    return;
+  }
+
+  const current = readCurrentViewState();
+  current.z = clamp(current.z + Math.max(1.4, Math.abs(current.z) * 0.35), MIN_Z, MAX_Z);
+  current.zoom = clamp(current.zoom * 1.25, MIN_ZOOM, MAX_ZOOM);
+  applyViewState(current);
+  saveManualStateForActive(current);
+}
+
 async function runFitSolver(assetId, seedState) {
   const token = ++activeFitToken;
   let state = cloneState(seedState);
   applyViewState(state);
 
-  // Mobile-safe path: avoid repeated readbacks/iterations that can trigger GPU memory pressure.
   if (IS_COARSE_POINTER) {
     setCachedFit(assetId, state);
     return;
   }
 
-  // Allow stream startup to produce a measurable frame.
   let measurement = null;
   for (let i = 0; i < MAX_BOOT_FRAMES; i += 1) {
     await raf();
@@ -392,7 +564,6 @@ async function runFitSolver(assetId, seedState) {
     measurement = measureFill();
     if (measurement) break;
 
-    // Fallback ramp: if we still cannot measure, push in progressively.
     state.z = clamp(state.z + 0.55, MIN_Z, MAX_Z);
     state.zoom = clamp(state.zoom * 1.08, MIN_ZOOM, MAX_ZOOM);
     applyViewState(state);
@@ -416,15 +587,12 @@ async function runFitSolver(assetId, seedState) {
       break;
     }
 
-    // Bias subject lower in frame so origin reads nearer bottom-center.
     state.y = clamp(state.y + (centerErr * Math.abs(state.z) * -0.16), -8, 8);
 
     if (fill < TARGET_FILL_MIN) {
-      // Move closer and scale up.
       state.z = clamp(state.z + clamp((TARGET_FILL_MIN - fill) * 3.2, 0.18, 0.95), MIN_Z, MAX_Z);
       state.zoom = clamp(state.zoom * 1.045, MIN_ZOOM, MAX_ZOOM);
     } else if (fill > TARGET_FILL_MAX) {
-      // Move farther and slightly scale down.
       state.z = clamp(state.z - clamp((fill - TARGET_FILL_MAX) * 3.8, 0.24, 1.2), MIN_Z, MAX_Z);
       state.zoom = clamp(state.zoom * 0.955, MIN_ZOOM, MAX_ZOOM);
     }
@@ -448,9 +616,28 @@ async function fitActiveAsset() {
   await runFitSolver(activeAssetId, seed);
 }
 
+function getAssetTimingMetrics(loadStart, assetId) {
+  const readyMs = Math.round(performance.now() - loadStart);
+  const entry = performance.getEntriesByType("resource")
+    .find((resource) => String(resource.name || "").includes(assetId));
+
+  if (!entry) {
+    return { asset_id: assetId, dns_ms: null, connect_ms: null, download_ms: null, ready_ms: readyMs };
+  }
+
+  return {
+    asset_id: assetId,
+    dns_ms: entry.domainLookupEnd > 0 ? Math.round(entry.domainLookupEnd - entry.domainLookupStart) : null,
+    connect_ms: entry.connectEnd > 0 ? Math.round(entry.connectEnd - entry.connectStart) : null,
+    download_ms: entry.responseEnd > 0 ? Math.round(entry.responseEnd - entry.responseStart) : null,
+    ready_ms: readyMs
+  };
+}
 function setActiveAsset(assetId) {
   const selected = getAssetById(assetId);
   if (!selected) return;
+  const loadStart = performance.now();
+
   if (!componentsReady) {
     setActiveButton(assetId);
     activeAssetId = assetId;
@@ -481,7 +668,16 @@ function setActiveAsset(assetId) {
     applyViewState(manualView ?? cachedFit ?? defaultView);
   }
 
+  viewerRuntime.ensureYawReference(assetId, readCurrentViewState().rotationY);
   ensureMobileVisibility(assetId);
+
+  const timing = getAssetTimingMetrics(loadStart, assetId);
+  emitTelemetry("asset_loaded", {
+    asset_id: assetId,
+    load_ms: timing.ready_ms
+  }, "viewer");
+  emitTelemetry("asset_load_timing", timing, "perf");
+  telemetryClient.setSessionContext?.({ asset_id: assetId });
   updateDebugHud();
 }
 
@@ -491,25 +687,41 @@ MIRIS_ASSETS.forEach((asset) => {
   button.disabled = true;
   button.textContent = asset.label;
   button.dataset.assetId = asset.id;
-  button.addEventListener("click", () => {
+  button.addEventListener("click", (event) => {
+    trackRageClick(event.currentTarget);
+    emitTelemetry("button_pressed", {
+      button_id: `asset_${asset.id}`,
+      context: "top_controls"
+    }, "ui");
     setActiveAsset(asset.id);
   });
   controlsRoot.appendChild(button);
 });
 
-function createViewControlButton(label, onClick) {
+function createViewControlButton(label, onClick, buttonId) {
   const button = document.createElement("button");
   button.type = "button";
   button.disabled = true;
   button.className = "view-tool";
   button.textContent = label;
-  button.addEventListener("click", onClick);
+  button.addEventListener("click", (event) => {
+    trackRageClick(event.currentTarget);
+    emitTelemetry("button_pressed", {
+      button_id: buttonId,
+      context: "top_controls"
+    }, "ui");
+    onClick();
+  });
   controlsRoot.appendChild(button);
 }
 
 createViewControlButton("Auto Spin", () => {
   autoSpinEnabled = !autoSpinEnabled;
-});
+  emitTelemetry("feature_toggled", {
+    feature_id: "autoSpin",
+    enabled: autoSpinEnabled
+  }, "viewer");
+}, "auto_spin");
 
 function createZoomExtentsToggle() {
   const label = document.createElement("label");
@@ -521,6 +733,10 @@ function createZoomExtentsToggle() {
   input.checked = zoomExtentsEnabled;
   input.addEventListener("change", () => {
     zoomExtentsEnabled = input.checked;
+    emitTelemetry("feature_toggled", {
+      feature_id: "zoomExtents",
+      enabled: zoomExtentsEnabled
+    }, "viewer");
     if (zoomExtentsEnabled && activeAssetId) {
       fitActiveAsset();
     }
@@ -536,6 +752,136 @@ function createZoomExtentsToggle() {
 
 createZoomExtentsToggle();
 
+function navigateTo(url) {
+  if (!url) return;
+  const openInNewTab = Boolean(builderConfig.cta.openInNewTab);
+  if (openInNewTab) {
+    window.open(url, "_blank", "noopener,noreferrer");
+  } else {
+    window.location.href = url;
+  }
+}
+
+function copyToClipboard(text) {
+  if (!text) return Promise.resolve(false);
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text).then(() => true).catch(() => false);
+  }
+  const input = document.createElement("textarea");
+  input.value = text;
+  document.body.appendChild(input);
+  input.select();
+  const success = document.execCommand("copy");
+  document.body.removeChild(input);
+  return Promise.resolve(Boolean(success));
+}
+
+function trackAndNavigate(eventName, ctaId, destination) {
+  emitTelemetry("button_pressed", {
+    button_id: ctaId,
+    context: "builder_cta"
+  }, "cta");
+
+  emitTelemetry(eventName, {
+    cta_id: ctaId,
+    destination,
+    context: "builder_cta",
+    asset_id: activeAssetId || null
+  }, "cta");
+
+  if (!destination) return;
+  setTimeout(() => {
+    navigateTo(destination);
+  }, 120);
+}
+
+const builderPanel = createBuilderPanel({
+  registry: featureRegistry,
+  getConfig: () => builderConfig,
+  onToggleFeature(featureId, enabled) {
+    builderConfig.features[featureId].enabled = enabled;
+    saveBuilderConfig(builderConfig);
+    emitTelemetry("feature_toggled", {
+      feature_id: featureId,
+      enabled
+    }, "viewer");
+
+    if (enabled) {
+      featureEnableStarts.set(featureId, performance.now());
+    } else if (featureEnableStarts.has(featureId)) {
+      const startedAt = featureEnableStarts.get(featureId);
+      const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
+      featureEnableStarts.delete(featureId);
+      emitTelemetry("feature_usage_window", {
+        feature_id: featureId,
+        duration_ms: durationMs
+      }, "viewer");
+    }
+
+    if (activeAssetId) {
+      const state = readCurrentViewState();
+      applyViewState(state);
+      saveManualStateForActive(state);
+    }
+  },
+  onChangeSetting(featureId, key, value) {
+    const prevValue = builderConfig.features[featureId].settings[key];
+    builderConfig.features[featureId].settings[key] = value;
+    saveBuilderConfig(builderConfig);
+    emitTelemetry("setting_changed", {
+      feature_id: featureId,
+      key,
+      previous: prevValue,
+      value
+    }, "viewer");
+
+    if (activeAssetId) {
+      const state = readCurrentViewState();
+      applyViewState(state);
+      saveManualStateForActive(state);
+    }
+  },
+  onChangeCta(key, value) {
+    builderConfig.cta[key] = value;
+    saveBuilderConfig(builderConfig);
+    builderPanel.render();
+  },
+  onTelemetryChange(key, value) {
+    builderConfig.telemetry[key] = value;
+    saveBuilderConfig(builderConfig);
+    rebuildTelemetryClient();
+    builderPanel.render();
+  },
+  onCtaClick(ctaId, url) {
+    if (ctaId === "view_product") {
+      trackAndNavigate("view_product_clicked", ctaId, url);
+      return;
+    }
+
+    if (ctaId === "enquire") {
+      trackAndNavigate("enquiry_clicked", ctaId, url);
+      return;
+    }
+
+    if (ctaId === "buy_now") {
+      trackAndNavigate("purchase_link_clicked", ctaId, url);
+    }
+  },
+  onUtilityAction(actionId, value) {
+    if (actionId === "share_clicked") {
+      const destination = value || window.location.href;
+      emitTelemetry("share_clicked", { destination, context: "builder_cta" }, "cta");
+      void copyToClipboard(destination);
+      return;
+    }
+
+    void copyToClipboard(value).then((ok) => {
+      emitTelemetry(actionId, { context: "builder_cta", success: ok }, "cta");
+    });
+  }
+});
+
+document.body.appendChild(builderPanel.element);
 viewerStage.addEventListener("contextmenu", (event) => {
   event.preventDefault();
 });
@@ -578,10 +924,11 @@ function getTouchDistance(points) {
 }
 
 viewerStage.addEventListener("pointerdown", (event) => {
-  // Cancel any in-flight auto-fit as soon as user takes control.
   activeFitToken += 1;
+  trackRageClick(event.target);
 
   if (event.pointerType === "touch") {
+    markInteraction("rotate", "touch");
     touchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
     viewerStage.setPointerCapture(event.pointerId);
 
@@ -595,6 +942,7 @@ viewerStage.addEventListener("pointerdown", (event) => {
   }
 
   if (event.button === 0) {
+    markInteraction("rotate", "mouse");
     isRotating = true;
     rotatePointerId = event.pointerId;
     lastRotateX = event.clientX;
@@ -605,6 +953,7 @@ viewerStage.addEventListener("pointerdown", (event) => {
   }
 
   if (event.button !== 2) return;
+  markInteraction("pan", "mouse");
   isPanning = true;
   panPointerId = event.pointerId;
   lastPanX = event.clientX;
@@ -628,6 +977,7 @@ viewerStage.addEventListener("pointermove", (event) => {
       lastTouchCenterX = point.x;
       lastTouchCenterY = point.y;
     } else if (points.length >= 2) {
+      markInteraction("zoom", "touch");
       const center = getTouchCenter(points);
       const distance = getTouchDistance(points);
       const dx = center.x - lastTouchCenterX;
@@ -696,6 +1046,8 @@ function endPointer(event) {
       lastTouchCenterY = center.y;
     }
     lastTouchDistance = getTouchDistance(remainingPoints);
+    if (remainingPoints.length < 2) endInteraction("zoom");
+    if (remainingPoints.length === 0) endInteraction("rotate");
     event.preventDefault();
     return;
   }
@@ -703,11 +1055,13 @@ function endPointer(event) {
   if (isPanning && event.pointerId === panPointerId) {
     isPanning = false;
     panPointerId = null;
+    endInteraction("pan");
   }
 
   if (isRotating && event.pointerId === rotatePointerId) {
     isRotating = false;
     rotatePointerId = null;
+    endInteraction("rotate");
   }
 
   event.preventDefault();
@@ -724,6 +1078,7 @@ viewerStage.addEventListener("dblclick", () => {
 viewerStage.addEventListener("wheel", (event) => {
   if (!activeAssetId) return;
 
+  markInteraction("zoom", "wheel");
   activeFitToken += 1;
 
   const current = readCurrentViewState();
@@ -739,9 +1094,12 @@ viewerStage.addEventListener("wheel", (event) => {
 
   applyViewState(current);
   saveManualStateForActive(current);
+
+  clearTimeout(viewerStage._zoomEndTimer);
+  viewerStage._zoomEndTimer = setTimeout(() => endInteraction("zoom"), 140);
+
   event.preventDefault();
 }, { passive: false });
-
 let lastViewportKey = getViewportKey();
 window.addEventListener("resize", () => {
   const currentKey = getViewportKey();
@@ -753,12 +1111,47 @@ window.addEventListener("resize", () => {
   }
 }, { passive: true });
 
+function maybeEmitPerfSample(nowMs) {
+  if ((nowMs - lastPerfSampleMs) < 5000) return;
+  const elapsedSec = frameElapsedWindow / 1000;
+  const fps = elapsedSec > 0 ? (frameCountWindow / elapsedSec) : 0;
+  fpsBucket = inferFpsBucket(fps);
+  emitTelemetry("perf_sample", {
+    fps_bucket: fpsBucket,
+    fps: Number(fps.toFixed(2)),
+    long_frame_count_delta: longFrameCount
+  }, "perf");
+  frameCountWindow = 0;
+  frameElapsedWindow = 0;
+  lastPerfSampleMs = nowMs;
+}
+
 function animate() {
+  const nowMs = performance.now();
+  const deltaMs = Math.max(0, nowMs - lastFrameTimeMs);
+  lastFrameTimeMs = nowMs;
+
+  frameCountWindow += 1;
+  frameElapsedWindow += deltaMs;
+  if (deltaMs > 50) longFrameCount += 1;
+
+  attachWebglContextListenersIfNeeded();
+  maybeEmitPerfSample(nowMs);
+
   if (autoSpinEnabled && activeAssetId && !isRotating) {
     const current = readCurrentViewState();
     current.rotationY += AUTO_SPIN_SPEED;
     applyViewState(current);
     saveManualStateForActive(current);
+  }
+
+  if (activeAssetId) {
+    const current = readCurrentViewState();
+    const constrained = enforceRuntimeConstraints(current);
+    if (Math.abs(constrained.rotationY - current.rotationY) > 1e-6) {
+      applyViewState(constrained);
+      saveManualStateForActive(constrained);
+    }
   }
 
   updateDebugHud();
@@ -780,10 +1173,16 @@ async function startViewer() {
     const msg = typeof error?.message === "string" ? error.message : String(error);
     lastRuntimeError = `viewer init failed: ${msg}`;
     updateDebugHud();
+    emitTelemetry("viewer_error", { message: msg, stack: error?.stack || null, context: "startViewer" }, "error");
     return;
   }
 
   componentsReady = true;
+  await telemetryClient.startSession({
+    asset_id: activeAssetId || MIRIS_ASSETS[0].id,
+    device_type: IS_COARSE_POINTER ? "mobile" : "desktop"
+  });
+
   setControlsEnabled(true);
   const preferred = activeAssetId || MIRIS_ASSETS[0].id;
   setActiveAsset(preferred);
@@ -792,13 +1191,52 @@ async function startViewer() {
 
 startViewer();
 
+async function endTelemetry(reason) {
+  if (hasEndedSession) return;
+  hasEndedSession = true;
+  finalizeOpenInteractions();
+
+  await telemetryClient.endSession(reason, {
+    interaction_counts: interactionCounts,
+    interaction_durations_ms: interactionDurationsMs,
+    first_interaction_ms: firstInteractionMs,
+    fps_bucket: fpsBucket,
+    long_frame_count: longFrameCount,
+    telemetry_send_fail_count: telemetrySendFailCount,
+    webgl_context_lost_count: webglContextLostCount,
+    webgl_context_restored_count: webglContextRestoredCount
+  });
+}
+
+window.addEventListener("beforeunload", () => {
+  void endTelemetry("beforeunload");
+});
+
+window.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    void endTelemetry("hidden");
+  }
+});
+
 window.addEventListener("error", (event) => {
   lastRuntimeError = event.message || "window error";
+  emitTelemetry("viewer_error", {
+    message: lastRuntimeError,
+    stack: event.error?.stack || null,
+    filename: event.filename || null,
+    lineno: event.lineno || null,
+    colno: event.colno || null
+  }, "error");
   updateDebugHud();
 });
 
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event.reason;
   lastRuntimeError = typeof reason === "string" ? reason : (reason?.message || "unhandled rejection");
+  emitTelemetry("viewer_error", {
+    message: lastRuntimeError,
+    stack: reason?.stack || null,
+    context: "unhandledrejection"
+  }, "error");
   updateDebugHud();
 });

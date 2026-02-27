@@ -1,5 +1,8 @@
 export const MIRIS_VIEWER_KEY = "SCpKAMoKc-mLURyO0DJQnSUIHYBmEclh5j5i1a_qteA";
 
+export const VIEWER_VERSION = "builder-v1";
+export const TELEMETRY_ENDPOINT = "https://ungmzkpvubdtsewpdgfu.supabase.co/functions/v1/ingest-event";
+
 export const MIRIS_CAMERA = {
   x: 0,
   y: 1,
