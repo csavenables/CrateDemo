@@ -1,5 +1,14 @@
 
-import { MIRIS_ASSETS, MIRIS_VIEWER_KEY, TELEMETRY_ENDPOINT, VIEWER_VERSION } from "./splat-config.js";
+import {
+  MIRIS_ASSETS,
+  MIRIS_INITIAL_VIEW,
+  MIRIS_LIGHTING,
+  MIRIS_ORBIT_PIVOT_OFFSET,
+  MIRIS_VIEWER_KEY,
+  SUPPRESS_MIRIS_LOD_WARNINGS,
+  TELEMETRY_ENDPOINT,
+  VIEWER_VERSION
+} from "./splat-config.js";
 import { createFeatureRegistry } from "./src/features/featureRegistry.js";
 import { createViewerRuntime } from "./src/runtime/viewerRuntime.js";
 import { loadBuilderConfig, saveBuilderConfig } from "./src/config/builderConfig.js";
@@ -13,34 +22,72 @@ if (!viewerStage || !controlsRoot) {
   throw new Error("Missing required DOM elements.");
 }
 
-if (!MIRIS_VIEWER_KEY || !Array.isArray(MIRIS_ASSETS) || MIRIS_ASSETS.length !== 3) {
+if (!MIRIS_VIEWER_KEY || !Array.isArray(MIRIS_ASSETS) || MIRIS_ASSETS.length !== 4) {
   throw new Error("Invalid Miris config. Check splat-config.js.");
 }
 
 const featureRegistry = createFeatureRegistry();
 let builderConfig = loadBuilderConfig(featureRegistry);
 
+if (SUPPRESS_MIRIS_LOD_WARNINGS) {
+  const originalWarn = console.warn.bind(console);
+  console.warn = (...args) => {
+    const first = args[0];
+    if (typeof first === "string" && first.includes("Received modified event for LOD") && first.includes("does not exist")) {
+      return;
+    }
+    originalWarn(...args);
+  };
+}
+
 const sceneEl = document.createElement("miris-scene");
 sceneEl.setAttribute("key", MIRIS_VIEWER_KEY);
 sceneEl.style.width = "100%";
 sceneEl.style.height = "100%";
+sceneEl.style.backgroundColor = "#ffffff";
+if (Number.isFinite(Number(MIRIS_LIGHTING?.ambientBrightness)) && Number(MIRIS_LIGHTING.ambientBrightness) > 0) {
+  sceneEl.style.filter = `brightness(${Number(MIRIS_LIGHTING.ambientBrightness)})`;
+}
 
-const streamEl = document.createElement("miris-stream");
-sceneEl.appendChild(streamEl);
+const ORBIT_PIVOT_OFFSET = {
+  x: Number(MIRIS_ORBIT_PIVOT_OFFSET?.x) || 0,
+  y: Number(MIRIS_ORBIT_PIVOT_OFFSET?.y) || 0,
+  z: Number(MIRIS_ORBIT_PIVOT_OFFSET?.z) || 0
+};
+const STREAM_MODE_TAGGED_EVENTS = new Set([
+  "perf_sample",
+  "asset_load_timing",
+  "asset_loaded",
+  "scene_navigated",
+  "scene_switch_latency"
+]);
+
+const orbitPivotEl = document.createElement("miris-group");
+const pivotContentEl = document.createElement("miris-group");
+pivotContentEl.style.position = "relative";
+pivotContentEl.style.width = "100%";
+pivotContentEl.style.height = "100%";
+pivotContentEl.setAttribute(
+  "position",
+  `${-ORBIT_PIVOT_OFFSET.x} ${-ORBIT_PIVOT_OFFSET.y} ${-ORBIT_PIVOT_OFFSET.z}`
+);
+
+orbitPivotEl.appendChild(pivotContentEl);
+sceneEl.appendChild(orbitPivotEl);
 viewerStage.appendChild(sceneEl);
 
 let activeAssetId = "";
-let zoomExtentsEnabled = true;
 let autoSpinEnabled = false;
+let streamMode = "single";
+let streamController = null;
 const IS_COARSE_POINTER = window.matchMedia("(pointer: coarse)").matches;
-const MOBILE_Z_SCALE = 0.62;
-const MOBILE_ZOOM_SCALE = 1.22;
 let componentsReady = false;
 const DEBUG_MODE = new URLSearchParams(window.location.search).get("debug") === "1";
 let lastRuntimeError = "";
+let lastSceneSwitchLatencyMs = null;
+let lastMeasuredFps = 0;
 
 const manualStateByAssetId = new Map();
-const fitProfileByAssetId = new Map();
 const featureEnableStarts = new Map();
 
 const MIN_ZOOM = 0.08;
@@ -56,21 +103,11 @@ const AUTO_SPIN_SPEED = 0.012;
 const WHEEL_DOLLY_SPEED = 0.009;
 const TOUCH_PINCH_DOLLY_SPEED = 0.018;
 
-const TARGET_FILL_MIN = 0.78;
-const TARGET_FILL_MAX = 0.88;
-const TARGET_CENTER_Y = 0.14;
-const MAX_FIT_STEPS = 22;
-const MAX_BOOT_FRAMES = 55;
 const RAGE_CLICK_WINDOW_MS = 1200;
 const RAGE_CLICK_THRESHOLD = 4;
-
-let activeFitToken = 0;
+const DEG_TO_RAD = Math.PI / 180;
 
 let renderCanvasCache = null;
-const sampleCanvas = document.createElement("canvas");
-sampleCanvas.width = 192;
-sampleCanvas.height = 108;
-const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
 
 const interactionCounts = { rotate: 0, zoom: 0, pan: 0 };
 const interactionDurationsMs = { rotate: 0, zoom: 0, pan: 0 };
@@ -121,7 +158,10 @@ function getTelemetryEndpoint() {
 }
 
 function emitTelemetry(name, payload = {}, category = "viewer") {
-  telemetryClient.track(name, payload, category);
+  const nextPayload = STREAM_MODE_TAGGED_EVENTS.has(name)
+    ? { ...payload, stream_mode: streamMode }
+    : payload;
+  telemetryClient.track(name, nextPayload, category);
 }
 
 function handleTelemetrySendFailure({ eventName, reason }) {
@@ -158,10 +198,10 @@ function rebuildTelemetryClient() {
 
 function hasStreamTransformApi() {
   return Boolean(
-    streamEl.position &&
-    typeof streamEl.position.set === "function" &&
-    streamEl.rotation &&
-    typeof streamEl.rotation.set === "function"
+    orbitPivotEl.position &&
+    typeof orbitPivotEl.position.set === "function" &&
+    orbitPivotEl.rotation &&
+    typeof orbitPivotEl.rotation.set === "function"
   );
 }
 
@@ -289,10 +329,125 @@ function getAssetById(assetId) {
   return MIRIS_ASSETS.find((asset) => asset.id === assetId);
 }
 
+function clearPivotStreams() {
+  pivotContentEl.querySelectorAll("miris-stream").forEach((node) => node.remove());
+}
+
+function applyBaseRotationToStream(streamEl, asset) {
+  if (!streamEl || !asset) return;
+  const base = getAssetBaseRotationRadians(asset);
+  if (streamEl.rotation && typeof streamEl.rotation.set === "function") {
+    streamEl.rotation.set(base.x, base.y, base.z);
+  }
+  streamEl.setAttribute("rotation", `${base.x} ${base.y} ${base.z}`);
+}
+
+function createSingleStreamController() {
+  let streamEl = null;
+  return {
+    mode: "single",
+    init() {
+      streamEl = document.createElement("miris-stream");
+      streamEl.className = "stream-single-item";
+      pivotContentEl.appendChild(streamEl);
+    },
+    destroy() {
+      if (streamEl?.parentNode) streamEl.parentNode.removeChild(streamEl);
+      streamEl = null;
+    },
+    setActiveAsset(asset) {
+      if (!streamEl || !asset) return;
+      streamEl.uuid = asset.uuid;
+      applyBaseRotationToStream(streamEl, asset);
+    },
+    getMountedStreamCount() {
+      return streamEl ? 1 : 0;
+    }
+  };
+}
+
+function createStreamController(mode) {
+  return createSingleStreamController();
+}
+
+function getAssetBaseRotationRadians(asset) {
+  if (Array.isArray(asset?.baseRotationDegrees) && asset.baseRotationDegrees.length === 3) {
+    return {
+      x: (Number(asset.baseRotationDegrees[0]) || 0) * DEG_TO_RAD,
+      y: (Number(asset.baseRotationDegrees[1]) || 0) * DEG_TO_RAD,
+      z: (Number(asset.baseRotationDegrees[2]) || 0) * DEG_TO_RAD
+    };
+  }
+
+  const legacyY = Number(asset?.baseRotationY);
+  return {
+    x: 0,
+    y: Number.isFinite(legacyY) ? legacyY : 0,
+    z: 0
+  };
+}
+
+function getConfiguredInitialViewState() {
+  if (!MIRIS_INITIAL_VIEW || typeof MIRIS_INITIAL_VIEW !== "object") return null;
+
+  const rotationDegrees = Array.isArray(MIRIS_INITIAL_VIEW.rotationDegrees) && MIRIS_INITIAL_VIEW.rotationDegrees.length === 3
+    ? MIRIS_INITIAL_VIEW.rotationDegrees
+    : [0, 0, 0];
+
+  return {
+    x: Number(MIRIS_INITIAL_VIEW.x) || 0,
+    y: Number(MIRIS_INITIAL_VIEW.y) || 0,
+    z: Number(MIRIS_INITIAL_VIEW.z) || -6,
+    zoom: clamp(Number(MIRIS_INITIAL_VIEW.zoom) || 1, MIN_ZOOM, MAX_ZOOM),
+    rotationX: (Number(rotationDegrees[0]) || 0) * DEG_TO_RAD,
+    rotationY: (Number(rotationDegrees[1]) || 0) * DEG_TO_RAD,
+    rotationZ: (Number(rotationDegrees[2]) || 0) * DEG_TO_RAD
+  };
+}
+
 function setActiveButton(assetId) {
+  controlsRoot.dataset.activeAssetId = assetId || "";
   controlsRoot.querySelectorAll("button[data-asset-id]").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.assetId === assetId);
   });
+}
+
+function getActiveAssetIndex() {
+  const selectedId = activeAssetId || MIRIS_ASSETS[0]?.id;
+  const index = MIRIS_ASSETS.findIndex((asset) => asset.id === selectedId);
+  return index >= 0 ? index : 0;
+}
+
+function getWrappedIndex(index) {
+  if (!MIRIS_ASSETS.length) return -1;
+  return ((index % MIRIS_ASSETS.length) + MIRIS_ASSETS.length) % MIRIS_ASSETS.length;
+}
+
+function navigateScene(direction) {
+  if (!MIRIS_ASSETS.length) return;
+
+  const fromIndex = getWrappedIndex(getActiveAssetIndex());
+  const delta = direction === "right" ? 1 : -1;
+  const toIndex = getWrappedIndex(fromIndex + delta);
+
+  const fromAssetId = MIRIS_ASSETS[fromIndex]?.id || null;
+  const nextAsset = MIRIS_ASSETS[toIndex];
+  if (!nextAsset) return;
+
+  const wrapped = direction === "right"
+    ? fromIndex === MIRIS_ASSETS.length - 1
+    : fromIndex === 0;
+
+  emitTelemetry("scene_navigated", {
+    from_asset_id: fromAssetId,
+    to_asset_id: nextAsset.id,
+    from_index: fromIndex,
+    to_index: toIndex,
+    direction,
+    wrapped
+  }, "ui");
+
+  setActiveAsset(nextAsset.id);
 }
 
 function getDistanceFromAssetDefaults(asset) {
@@ -323,10 +478,6 @@ function getDefaultViewState(asset) {
       rotationY: 0,
       rotationZ: 0
     };
-    if (IS_COARSE_POINTER) {
-      state.z = clamp(state.z * MOBILE_Z_SCALE, MIN_Z, MAX_Z);
-      state.zoom = clamp(state.zoom * MOBILE_ZOOM_SCALE, MIN_ZOOM, MAX_ZOOM);
-    }
     return state;
   }
 
@@ -345,22 +496,18 @@ function getDefaultViewState(asset) {
     rotationY: 0,
     rotationZ: 0
   };
-  if (IS_COARSE_POINTER) {
-    state.z = clamp(state.z * MOBILE_Z_SCALE, MIN_Z, MAX_Z);
-    state.zoom = clamp(state.zoom * MOBILE_ZOOM_SCALE, MIN_ZOOM, MAX_ZOOM);
-  }
   return state;
 }
 
 function readCurrentViewState() {
   return {
-    x: Number(streamEl.position?.x) || 0,
-    y: Number(streamEl.position?.y) || 0,
-    z: Number(streamEl.position?.z) || -5,
-    zoom: clamp(Number(streamEl.zoom) || 1, MIN_ZOOM, MAX_ZOOM),
-    rotationX: Number(streamEl.rotation?.x) || 0,
-    rotationY: Number(streamEl.rotation?.y) || 0,
-    rotationZ: Number(streamEl.rotation?.z) || 0
+    x: (Number(orbitPivotEl.position?.x) || 0) - ORBIT_PIVOT_OFFSET.x,
+    y: (Number(orbitPivotEl.position?.y) || 0) - ORBIT_PIVOT_OFFSET.y,
+    z: clamp((Number(orbitPivotEl.position?.z) || -5) - ORBIT_PIVOT_OFFSET.z, MIN_Z, MAX_Z),
+    zoom: clamp(Number(orbitPivotEl.zoom) || 1, MIN_ZOOM, MAX_ZOOM),
+    rotationX: Number(orbitPivotEl.rotation?.x) || 0,
+    rotationY: Number(orbitPivotEl.rotation?.y) || 0,
+    rotationZ: Number(orbitPivotEl.rotation?.z) || 0
   };
 }
 
@@ -388,9 +535,13 @@ function enforceRuntimeConstraints(state) {
 function applyViewState(state) {
   if (!hasStreamTransformApi()) return;
   const safe = enforceRuntimeConstraints(state);
-  streamEl.position.set(safe.x, safe.y, clamp(safe.z, MIN_Z, MAX_Z));
-  streamEl.zoom = safe.zoom;
-  streamEl.rotation.set(safe.rotationX, safe.rotationY, safe.rotationZ);
+  orbitPivotEl.position.set(
+    safe.x + ORBIT_PIVOT_OFFSET.x,
+    safe.y + ORBIT_PIVOT_OFFSET.y,
+    clamp(safe.z + ORBIT_PIVOT_OFFSET.z, MIN_Z, MAX_Z)
+  );
+  orbitPivotEl.zoom = safe.zoom;
+  orbitPivotEl.rotation.set(safe.rotationX, safe.rotationY, safe.rotationZ);
 }
 
 function saveActiveManualState() {
@@ -401,29 +552,6 @@ function saveActiveManualState() {
 function saveManualStateForActive(state) {
   if (!activeAssetId) return;
   manualStateByAssetId.set(activeAssetId, cloneState(state));
-}
-function getViewportKey() {
-  const widthBucket = Math.max(1, Math.round(viewerStage.clientWidth / 160));
-  const heightBucket = Math.max(1, Math.round(viewerStage.clientHeight / 120));
-  return `${widthBucket}x${heightBucket}`;
-}
-
-function getCachedFit(assetId) {
-  const profile = fitProfileByAssetId.get(assetId);
-  if (!profile) return null;
-  if (profile.viewportKey !== getViewportKey()) return null;
-  return cloneState(profile.state);
-}
-
-function setCachedFit(assetId, state) {
-  fitProfileByAssetId.set(assetId, {
-    viewportKey: getViewportKey(),
-    state: cloneState(state)
-  });
-}
-
-function invalidateFitsForViewportChange() {
-  fitProfileByAssetId.clear();
 }
 
 function getRenderCanvas() {
@@ -466,156 +594,6 @@ function attachWebglContextListenersIfNeeded() {
   webglListenersAttached = true;
 }
 
-function measureFill() {
-  if (!sampleCtx) return null;
-  const canvas = getRenderCanvas();
-  if (!canvas || canvas.width < 4 || canvas.height < 4) return null;
-
-  const targetWidth = sampleCanvas.width;
-  const targetHeight = sampleCanvas.height;
-
-  sampleCtx.clearRect(0, 0, targetWidth, targetHeight);
-  sampleCtx.drawImage(canvas, 0, 0, targetWidth, targetHeight);
-  const data = sampleCtx.getImageData(0, 0, targetWidth, targetHeight).data;
-
-  let minX = targetWidth;
-  let minY = targetHeight;
-  let maxX = -1;
-  let maxY = -1;
-  let hitCount = 0;
-
-  for (let y = 0; y < targetHeight; y += 1) {
-    for (let x = 0; x < targetWidth; x += 1) {
-      const i = ((y * targetWidth) + x) * 4;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const a = data[i + 3];
-      const luminance = (r + g + b) / 3;
-      if (a < 6 || luminance < 6) continue;
-
-      hitCount += 1;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-    }
-  }
-
-  if (hitCount < 120 || maxX < minX || maxY < minY) {
-    return null;
-  }
-
-  const boxWidth = maxX - minX + 1;
-  const boxHeight = maxY - minY + 1;
-  const widthRatio = boxWidth / targetWidth;
-  const heightRatio = boxHeight / targetHeight;
-  const centerY = ((minY + maxY + 1) / 2 / targetHeight) - 0.5;
-  const areaRatio = (boxWidth * boxHeight) / (targetWidth * targetHeight);
-
-  return {
-    widthRatio,
-    heightRatio,
-    centerY,
-    areaRatio
-  };
-}
-
-function raf() {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
-}
-
-let mobileVisibilityToken = 0;
-async function ensureMobileVisibility(assetId) {
-  if (!IS_COARSE_POINTER) return;
-  const token = ++mobileVisibilityToken;
-
-  await raf();
-  await raf();
-  await raf();
-  if (token !== mobileVisibilityToken || activeAssetId !== assetId) return;
-
-  const measurement = measureFill();
-  if (measurement && measurement.heightRatio > 0.08) {
-    return;
-  }
-
-  const current = readCurrentViewState();
-  current.z = clamp(current.z + Math.max(1.4, Math.abs(current.z) * 0.35), MIN_Z, MAX_Z);
-  current.zoom = clamp(current.zoom * 1.25, MIN_ZOOM, MAX_ZOOM);
-  applyViewState(current);
-  saveManualStateForActive(current);
-}
-
-async function runFitSolver(assetId, seedState) {
-  const token = ++activeFitToken;
-  let state = cloneState(seedState);
-  applyViewState(state);
-
-  if (IS_COARSE_POINTER) {
-    setCachedFit(assetId, state);
-    return;
-  }
-
-  let measurement = null;
-  for (let i = 0; i < MAX_BOOT_FRAMES; i += 1) {
-    await raf();
-    if (token !== activeFitToken || activeAssetId !== assetId || !zoomExtentsEnabled) return;
-    measurement = measureFill();
-    if (measurement) break;
-
-    state.z = clamp(state.z + 0.55, MIN_Z, MAX_Z);
-    state.zoom = clamp(state.zoom * 1.08, MIN_ZOOM, MAX_ZOOM);
-    applyViewState(state);
-  }
-
-  if (!measurement) {
-    setCachedFit(assetId, state);
-    applyViewState(state);
-    return;
-  }
-
-  for (let step = 0; step < MAX_FIT_STEPS; step += 1) {
-    if (token !== activeFitToken || activeAssetId !== assetId || !zoomExtentsEnabled) return;
-
-    const fill = measurement.heightRatio;
-    const centerErr = measurement.centerY - TARGET_CENTER_Y;
-
-    const centered = Math.abs(centerErr) < 0.02;
-    const filled = fill >= TARGET_FILL_MIN && fill <= TARGET_FILL_MAX;
-    if (centered && filled) {
-      break;
-    }
-
-    state.y = clamp(state.y + (centerErr * Math.abs(state.z) * -0.16), -8, 8);
-
-    if (fill < TARGET_FILL_MIN) {
-      state.z = clamp(state.z + clamp((TARGET_FILL_MIN - fill) * 3.2, 0.18, 0.95), MIN_Z, MAX_Z);
-      state.zoom = clamp(state.zoom * 1.045, MIN_ZOOM, MAX_ZOOM);
-    } else if (fill > TARGET_FILL_MAX) {
-      state.z = clamp(state.z - clamp((fill - TARGET_FILL_MAX) * 3.8, 0.24, 1.2), MIN_Z, MAX_Z);
-      state.zoom = clamp(state.zoom * 0.955, MIN_ZOOM, MAX_ZOOM);
-    }
-
-    applyViewState(state);
-    await raf();
-    measurement = measureFill();
-    if (!measurement) break;
-  }
-
-  if (token !== activeFitToken || activeAssetId !== assetId || !zoomExtentsEnabled) return;
-  setCachedFit(assetId, state);
-  applyViewState(state);
-}
-
-async function fitActiveAsset() {
-  const asset = getAssetById(activeAssetId);
-  if (!asset) return;
-  const cached = getCachedFit(activeAssetId);
-  const seed = cached ?? getDefaultViewState(asset);
-  await runFitSolver(activeAssetId, seed);
-}
-
 function getAssetTimingMetrics(loadStart, assetId) {
   const readyMs = Math.round(performance.now() - loadStart);
   const entry = performance.getEntriesByType("resource")
@@ -637,6 +615,10 @@ function setActiveAsset(assetId) {
   const selected = getAssetById(assetId);
   if (!selected) return;
   const loadStart = performance.now();
+  const switchStart = performance.now();
+  const isFirstActivation = !activeAssetId;
+  const previousActiveAssetId = activeAssetId || null;
+  const carriedViewState = activeAssetId ? cloneState(readCurrentViewState()) : null;
 
   if (!componentsReady) {
     setActiveButton(assetId);
@@ -645,31 +627,38 @@ function setActiveAsset(assetId) {
   }
 
   if (activeAssetId === assetId) {
-    if (zoomExtentsEnabled) {
-      fitActiveAsset();
-    }
     return;
   }
 
   saveActiveManualState();
   setActiveButton(assetId);
-  streamEl.uuid = selected.uuid;
-  streamEl.setAttribute("uuid", selected.uuid);
+  streamController?.setActiveAsset?.(selected);
   activeAssetId = assetId;
 
-  const cachedFit = getCachedFit(assetId);
   const defaultView = getDefaultViewState(selected);
   const manualView = manualStateByAssetId.get(assetId);
+  const configuredInitialView = getConfiguredInitialViewState();
 
-  if (zoomExtentsEnabled) {
-    applyViewState(cachedFit ?? defaultView);
-    fitActiveAsset();
+  if (carriedViewState) {
+    applyViewState(carriedViewState);
+    saveManualStateForActive(carriedViewState);
   } else {
-    applyViewState(manualView ?? cachedFit ?? defaultView);
+    const nextView = isFirstActivation
+      ? (configuredInitialView ?? manualView ?? defaultView)
+      : (manualView ?? defaultView);
+    applyViewState(nextView);
+    saveManualStateForActive(nextView);
   }
 
   viewerRuntime.ensureYawReference(assetId, readCurrentViewState().rotationY);
-  ensureMobileVisibility(assetId);
+
+  const switchLatencyMs = Math.round(performance.now() - switchStart);
+  lastSceneSwitchLatencyMs = switchLatencyMs;
+  emitTelemetry("scene_switch_latency", {
+    from_asset_id: previousActiveAssetId,
+    to_asset_id: assetId,
+    latency_ms: switchLatencyMs
+  }, "perf");
 
   const timing = getAssetTimingMetrics(loadStart, assetId);
   emitTelemetry("asset_loaded", {
@@ -681,76 +670,65 @@ function setActiveAsset(assetId) {
   updateDebugHud();
 }
 
-MIRIS_ASSETS.forEach((asset) => {
+function createSceneNavButton({ text, ariaLabel, buttonId, direction, className }) {
   const button = document.createElement("button");
   button.type = "button";
   button.disabled = true;
-  button.textContent = asset.label;
-  button.dataset.assetId = asset.id;
-  button.addEventListener("click", (event) => {
-    trackRageClick(event.currentTarget);
-    emitTelemetry("button_pressed", {
-      button_id: `asset_${asset.id}`,
-      context: "top_controls"
-    }, "ui");
-    setActiveAsset(asset.id);
-  });
-  controlsRoot.appendChild(button);
-});
-
-function createViewControlButton(label, onClick, buttonId) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.disabled = true;
-  button.className = "view-tool";
-  button.textContent = label;
+  button.className = `scene-nav ${className}`;
+  button.textContent = text;
+  button.setAttribute("aria-label", ariaLabel);
   button.addEventListener("click", (event) => {
     trackRageClick(event.currentTarget);
     emitTelemetry("button_pressed", {
       button_id: buttonId,
       context: "top_controls"
     }, "ui");
-    onClick();
+    navigateScene(direction);
   });
   controlsRoot.appendChild(button);
 }
 
-createViewControlButton("Auto Spin", () => {
-  autoSpinEnabled = !autoSpinEnabled;
-  emitTelemetry("feature_toggled", {
-    feature_id: "autoSpin",
-    enabled: autoSpinEnabled
-  }, "viewer");
-}, "auto_spin");
+createSceneNavButton({
+  text: "←",
+  ariaLabel: "Previous scene",
+  buttonId: "scene_prev",
+  direction: "left",
+  className: "scene-nav--left"
+});
 
-function createZoomExtentsToggle() {
-  const label = document.createElement("label");
-  label.className = "view-tool-toggle";
+createSceneNavButton({
+  text: "→",
+  ariaLabel: "Next scene",
+  buttonId: "scene_next",
+  direction: "right",
+  className: "scene-nav--right"
+});
 
-  const input = document.createElement("input");
-  input.type = "checkbox";
-  input.disabled = true;
-  input.checked = zoomExtentsEnabled;
-  input.addEventListener("change", () => {
-    zoomExtentsEnabled = input.checked;
-    emitTelemetry("feature_toggled", {
-      feature_id: "zoomExtents",
-      enabled: zoomExtentsEnabled
-    }, "viewer");
-    if (zoomExtentsEnabled && activeAssetId) {
-      fitActiveAsset();
-    }
+function createSceneNumberButtons() {
+  const wrap = document.createElement("div");
+  wrap.className = "scene-index-nav";
+
+  MIRIS_ASSETS.forEach((asset, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "scene-index-btn";
+    button.dataset.assetId = asset.id;
+    button.textContent = String(index + 1);
+    button.addEventListener("click", (event) => {
+      trackRageClick(event.currentTarget);
+      emitTelemetry("button_pressed", {
+        button_id: `scene_${index + 1}`,
+        context: "bottom_controls"
+      }, "ui");
+      setActiveAsset(asset.id);
+    });
+    wrap.appendChild(button);
   });
 
-  const text = document.createElement("span");
-  text.textContent = "Zoom Extents";
-
-  label.appendChild(input);
-  label.appendChild(text);
-  controlsRoot.appendChild(label);
+  controlsRoot.appendChild(wrap);
 }
 
-createZoomExtentsToggle();
+createSceneNumberButtons();
 
 function navigateTo(url) {
   if (!url) return;
@@ -882,6 +860,32 @@ const builderPanel = createBuilderPanel({
 });
 
 document.body.appendChild(builderPanel.element);
+builderPanel.element.classList.add("is-hidden");
+builderPanel.element.setAttribute("aria-hidden", "true");
+
+const builderToggleButton = document.createElement("button");
+builderToggleButton.type = "button";
+builderToggleButton.className = "builder-toggle";
+builderToggleButton.textContent = "Builder";
+builderToggleButton.setAttribute("aria-expanded", "false");
+builderToggleButton.setAttribute("aria-controls", "builder-panel");
+builderPanel.element.id = "builder-panel";
+
+builderToggleButton.addEventListener("click", (event) => {
+  trackRageClick(event.currentTarget);
+  const nextVisible = builderPanel.element.classList.contains("is-hidden");
+  builderPanel.element.classList.toggle("is-hidden", !nextVisible);
+  builderPanel.element.setAttribute("aria-hidden", String(!nextVisible));
+  builderToggleButton.setAttribute("aria-expanded", String(nextVisible));
+  emitTelemetry("button_pressed", {
+    button_id: "builder_toggle",
+    context: "top_controls",
+    visible: nextVisible
+  }, "ui");
+});
+
+document.body.appendChild(builderToggleButton);
+
 viewerStage.addEventListener("contextmenu", (event) => {
   event.preventDefault();
 });
@@ -924,7 +928,6 @@ function getTouchDistance(points) {
 }
 
 viewerStage.addEventListener("pointerdown", (event) => {
-  activeFitToken += 1;
   trackRageClick(event.target);
 
   if (event.pointerType === "touch") {
@@ -1071,15 +1074,13 @@ viewerStage.addEventListener("pointerup", endPointer);
 viewerStage.addEventListener("pointercancel", endPointer);
 
 viewerStage.addEventListener("dblclick", () => {
-  if (!activeAssetId) return;
-  fitActiveAsset();
+  // Intentionally no auto-fit on double click; camera stays user-controlled.
 });
 
 viewerStage.addEventListener("wheel", (event) => {
   if (!activeAssetId) return;
 
   markInteraction("zoom", "wheel");
-  activeFitToken += 1;
 
   const current = readCurrentViewState();
   const wheelUnit = clamp(Math.abs(event.deltaY) / 120, 0.4, 3);
@@ -1100,21 +1101,12 @@ viewerStage.addEventListener("wheel", (event) => {
 
   event.preventDefault();
 }, { passive: false });
-let lastViewportKey = getViewportKey();
-window.addEventListener("resize", () => {
-  const currentKey = getViewportKey();
-  if (currentKey === lastViewportKey) return;
-  lastViewportKey = currentKey;
-  invalidateFitsForViewportChange();
-  if (zoomExtentsEnabled && activeAssetId) {
-    fitActiveAsset();
-  }
-}, { passive: true });
 
 function maybeEmitPerfSample(nowMs) {
   if ((nowMs - lastPerfSampleMs) < 5000) return;
   const elapsedSec = frameElapsedWindow / 1000;
   const fps = elapsedSec > 0 ? (frameCountWindow / elapsedSec) : 0;
+  lastMeasuredFps = fps;
   fpsBucket = inferFpsBucket(fps);
   emitTelemetry("perf_sample", {
     fps_bucket: fpsBucket,
@@ -1178,6 +1170,9 @@ async function startViewer() {
   }
 
   componentsReady = true;
+  streamController = createStreamController("single");
+  streamController.init();
+  streamMode = "single";
   await telemetryClient.startSession({
     asset_id: activeAssetId || MIRIS_ASSETS[0].id,
     device_type: IS_COARSE_POINTER ? "mobile" : "desktop"
